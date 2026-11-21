@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import heapq
+import os
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import BinaryIO
 
 SortKey = tuple[str, int, int, int, int]
@@ -29,6 +29,15 @@ class Phase:
     peak_chunk_bytes: int = 0
 
 
+@dataclass
+class ResumeState:
+    """上一次尝试已确认、本次续跑直接沿用的进度。"""
+
+    round_number: int
+    run_names: list[str]
+    phases: list[Phase]
+
+
 def _read_lines(source: BinaryIO, phase: Phase) -> Iterator[bytes]:
     for line in source:
         phase.records_read += 1
@@ -37,16 +46,28 @@ def _read_lines(source: BinaryIO, phase: Phase) -> Iterator[bytes]:
 
 
 def _write_run(path: Path, lines: Iterable[bytes], phase: Phase) -> Path:
-    with path.open("wb") as output:
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("wb") as output:
         for line in lines:
             phase.bytes_written += output.write(line)
             phase.records_written += 1
+    os.replace(temporary, path)
     phase.output_runs += 1
     return path
 
 
+def _sweep(directory: Path, keep: set[str]) -> None:
+    """清理不在已确认清单内的残留段（含未写全的临时段），失败不阻断执行。"""
+    try:
+        for child in directory.iterdir():
+            if child.is_file() and child.name not in keep:
+                child.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _spill_runs(
-    directory: Path, entries: Iterable[Entry], run_bytes: int, phase: Phase
+    directory: Path, entries: Iterable[Entry], run_bytes: int, phase: Phase, tag: str
 ) -> list[Path]:
     runs: list[Path] = []
     chunk: list[Entry] = []
@@ -54,7 +75,7 @@ def _spill_runs(
 
     def flush_chunk() -> None:
         chunk.sort(key=lambda entry: entry[0])
-        path = directory / f"run-0-{len(runs)}.jsonl"
+        path = directory / f"run-0-{len(runs)}-{tag}.jsonl"
         runs.append(_write_run(path, (line for _, line in chunk), phase))
         phase.peak_chunk_bytes = max(phase.peak_chunk_bytes, chunk_bytes)
         chunk.clear()
@@ -78,6 +99,7 @@ def _merge_pass(
     fan_in: int,
     key_from_line: Callable[[bytes], SortKey],
     phase: Phase,
+    tag: str,
 ) -> list[Path]:
     next_runs: list[Path] = []
     for start in range(0, len(runs), fan_in):
@@ -88,7 +110,7 @@ def _merge_pass(
             phase.output_runs += 1
             continue
 
-        path = directory / f"run-{round_number}-{len(next_runs)}.jsonl"
+        path = directory / f"run-{round_number}-{len(next_runs)}-{tag}.jsonl"
         with ExitStack() as readers:
             streams = [
                 _read_lines(readers.enter_context(source.open("rb")), phase)
@@ -98,8 +120,6 @@ def _merge_pass(
             next_runs.append(_write_run(path, merged, phase))
         phase.merged_groups += 1
         phase.max_fan_in = max(phase.max_fan_in, len(group))
-        for source in group:
-            source.unlink()
     return next_runs
 
 
@@ -110,27 +130,52 @@ def sort_on_disk(
     fan_in: int,
     key_from_line: Callable[[bytes], SortKey],
     row_from_line: Callable[[int, bytes], dict[str, str | int]],
+    directory: Path,
+    tag: str,
+    commit: Callable[[int, list[str], list[Phase]], None],
+    resume: ResumeState | None = None,
 ) -> tuple[list[dict[str, str | int]], list[Phase]]:
-    try:
-        with TemporaryDirectory(prefix="folio-sort-") as temp_dir:
-            directory = Path(temp_dir)
-            phases = [Phase("生成初始段")]
-            runs = _spill_runs(directory, entries, run_bytes, phases[0])
-            while len(runs) > 1:
-                round_number = len(phases)
-                phase = Phase(f"归并第 {round_number} 轮", input_runs=len(runs))
-                runs = _merge_pass(directory, runs, round_number, fan_in, key_from_line, phase)
-                phases.append(phase)
+    """生成初始段并逐轮有界归并，每轮完整写盘后由 commit 确认再进入下一轮。
 
-            final = Phase("读取上架顺序单", input_runs=len(runs))
-            phases.append(final)
-            if not runs:
-                return [], phases
-            with runs[0].open("rb") as source:
-                rows = [
-                    row_from_line(rank, line)
-                    for rank, line in enumerate(_read_lines(source, final), start=1)
-                ]
-            return rows, phases
+    目录内任意时刻至多保留相邻两轮的段：新一轮未由 commit 确认前，上一轮的
+    段一律保留；每轮确认后清扫不在清单内的残留段。commit 负责栅栏校验，旧
+    尝试的提交被拒绝时以异常中断本次执行，目录交给接手方处置。
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        if resume is None:
+            _sweep(directory, set())
+            phases = [Phase("生成初始段")]
+            runs = _spill_runs(directory, entries, run_bytes, phases[0], tag)
+            commit(0, [path.name for path in runs], phases)
+            _sweep(directory, {path.name for path in runs})
+        else:
+            if resume.round_number != len(resume.phases) - 1:
+                raise RuntimeError("执行检查点不完整，无法续跑")
+            missing = [name for name in resume.run_names if not (directory / name).is_file()]
+            if missing:
+                raise FileNotFoundError(f"已确认的段文件缺失: {', '.join(missing)}")
+            phases = list(resume.phases)
+            runs = [directory / name for name in resume.run_names]
+            _sweep(directory, set(resume.run_names))
+
+        while len(runs) > 1:
+            round_number = len(phases)
+            phase = Phase(f"归并第 {round_number} 轮", input_runs=len(runs))
+            runs = _merge_pass(directory, runs, round_number, fan_in, key_from_line, phase, tag)
+            phases.append(phase)
+            commit(round_number, [path.name for path in runs], phases)
+            _sweep(directory, {path.name for path in runs})
+
+        final = Phase("读取上架顺序单", input_runs=len(runs))
+        phases.append(final)
+        if not runs:
+            return [], phases
+        with runs[0].open("rb") as source:
+            rows = [
+                row_from_line(rank, line)
+                for rank, line in enumerate(_read_lines(source, final), start=1)
+            ]
+        return rows, phases
     except OSError as exc:
         raise RuntimeError("临时磁盘读写失败，未生成上架顺序单") from exc

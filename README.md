@@ -42,7 +42,7 @@ docker compose up -d --build --wait
 | frontend | Nginx 与原生 HTML、CSS、JavaScript |
 | backend | Python 3.11、FastAPI、SQLAlchemy |
 | worker | Python 持久队列执行与 Redis 唤醒信号 |
-| db | PostgreSQL 16，持久卷保存档案、执行、证据及审计 |
+| db | PostgreSQL 16，持久卷保存档案、执行、断点检查点、证据及审计 |
 | redis | Redis 7，追加日志卷保存队列唤醒信号 |
 
 编辑 `backend/src/services/domain.py` 可修改试算方法与业务表单说明。API 路由、数据定义和页面位于 `backend/src/routes/`、`backend/src/models/` 与 `frontend/src/pages/`。开发时更新源文件后重新构建对应服务。

@@ -24,6 +24,13 @@ runs = Table('business_runs', schema,
     Column('finished_at', String(32)),
     Column('created_at', String(32), nullable=False),
     Column('error', Text))
+checkpoints = Table('run_checkpoints', schema,
+    Column('run_id', ForeignKey('business_runs.id'), primary_key=True),
+    Column('round', Integer, nullable=False),
+    Column('token', String(36), nullable=False),
+    Column('manifest', JSON, nullable=False),
+    Column('phases', JSON, nullable=False),
+    Column('updated_at', String(32), nullable=False))
 evidence = Table('business_evidence', schema,
     Column('id', Integer, primary_key=True),
     Column('run_id', ForeignKey('business_runs.id'), nullable=False, unique=True),

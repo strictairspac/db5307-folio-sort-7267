@@ -1,12 +1,14 @@
 import hashlib
+import shutil
 import uuid
+from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy import and_, or_, select
 
-from src.config.settings import cache, engine
+from src.config.settings import ARTIFACTS, cache, engine
 from src.constants.workflow import Status
-from src.models.tables import audit, cases, evidence, runs
+from src.models.tables import audit, cases, checkpoints, evidence, runs
 from src.services import domain
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
@@ -76,6 +78,48 @@ def claim():
         return run.id, token, found(conn, cases, run.case_id)['payload']
 
 
+class FencedError(Exception):
+    """本尝试的执行权已被接手方取代，禁止再写入任何进度。"""
+
+
+class AttemptCheckpoint:
+    """单个执行尝试的断点读写；提交与尝试令牌栅栏在同一事务内完成。
+
+    提交成功即表示该轮已被当前执行权确认，同时刷新 started_at 充当心跳；
+    执行权已被接手时提交被拒绝，旧后台无法改掉接手方确认的进度。
+    """
+
+    def __init__(self, run_id, token):
+        self.run_id = run_id
+        self.token = token
+        self.tag = token
+
+    def load(self):
+        with engine.connect() as conn:
+            row = conn.execute(select(checkpoints)
+                               .where(checkpoints.c.run_id == self.run_id)).mappings().first()
+        if row is None:
+            return None
+        return {'round': row['round'], 'runs': list(row['manifest']),
+                'phases': list(row['phases'])}
+
+    def commit(self, round_number, run_names, phases):
+        values = {'round': round_number, 'token': self.token, 'manifest': list(run_names),
+                  'phases': list(phases), 'updated_at': utc_time()}
+        with engine.begin() as conn:
+            count = conn.execute(runs.update().where(runs.c.id == self.run_id,
+                                                     runs.c.attempt_token == self.token,
+                                                     runs.c.status == Status.RUNNING)
+                                 .values(started_at=utc_time())).rowcount
+            if not count:
+                raise FencedError(f'执行 {self.run_id} 已由接手的后台确认进度，本次尝试放弃写入')
+            updated = conn.execute(checkpoints.update()
+                                   .where(checkpoints.c.run_id == self.run_id)
+                                   .values(**values)).rowcount
+            if not updated:
+                conn.execute(checkpoints.insert().values(run_id=self.run_id, **values))
+
+
 def finish(run_id, token, result=None, error=None):
     digest = hashlib.sha256(canonical(result)).hexdigest() if result is not None else None
     status = Status.FAILED if error else Status.COMPLETE
@@ -84,10 +128,25 @@ def finish(run_id, token, result=None, error=None):
                         runs.c.attempt_token == token, runs.c.status == Status.RUNNING)
                         .values(status=status, finished_at=utc_time(), error=error)).rowcount
         if not count:
-            return
+            return False
+        conn.execute(checkpoints.delete().where(checkpoints.c.run_id == run_id))
         if result is not None:
             conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
         log(conn, 'worker', status.value, run_id)
+        return True
+
+
+def sweep_run_artifacts():
+    """清理已终结执行残留的段目录；排队或执行中的目录保留供续跑。"""
+    root = Path(ARTIFACTS) / 'runs'
+    if not root.is_dir():
+        return
+    with engine.connect() as conn:
+        active = {row.id for row in conn.execute(
+            select(runs.c.id).where(runs.c.status.in_([Status.QUEUED, Status.RUNNING])))}
+    for child in root.iterdir():
+        if child.is_dir() and child.name.isdigit() and int(child.name) not in active:
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def review(identity, note, actor):

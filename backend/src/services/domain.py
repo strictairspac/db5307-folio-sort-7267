@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from dataclasses import asdict
+from pathlib import Path
 
-from .folio_runs import Entry, SortKey, sort_on_disk
+from .folio_runs import Entry, Phase, ResumeState, SortKey, sort_on_disk
 
 SPEC = {
     "name": "微页典藏·馆藏征集号整理",
@@ -136,14 +138,30 @@ def validate(payload):
         pass
 
 
-def solve(payload, engine):
+def solve(payload, engine, *, directory, checkpointer):
     batch_no, run_bytes, fan_in, records = _batch_inputs(payload)
+    saved = checkpointer.load()
+    resume = None
+    if saved is not None:
+        resume = ResumeState(
+            round_number=saved["round"],
+            run_names=list(saved["runs"]),
+            phases=[Phase(**phase) for phase in saved["phases"]],
+        )
+
+    def commit(round_number, run_names, phases):
+        checkpointer.commit(round_number, list(run_names), [asdict(phase) for phase in phases])
+
     order, phases = sort_on_disk(
         _entries(records, run_bytes),
         run_bytes=run_bytes,
         fan_in=fan_in,
         key_from_line=_key_from_line,
         row_from_line=_row_from_line,
+        directory=Path(directory),
+        tag=checkpointer.tag,
+        commit=commit,
+        resume=resume,
     )
     metrics = {
         "上架件数": len(order),
